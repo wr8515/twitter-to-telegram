@@ -1,0 +1,8 @@
+# 作者：xxx
+.env
+config.yaml
+data/
+secrets/
+__pycache__/
+*.pyc
+

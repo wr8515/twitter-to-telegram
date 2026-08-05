@@ -1,0 +1,13 @@
+# 作者：xxx
+accounts:
+  - username: zaobaosg
+    source: auto
+    feed_url: https://your-rss-instance.example/zaobaosg/rss
+
+  - username: nytchinese
+    source: rss
+    feed_url: https://your-rss-instance.example/nytchinese/rss
+
+  - username: example_account
+    source: x
+

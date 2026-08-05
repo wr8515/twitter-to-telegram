@@ -1,0 +1,7 @@
+# 作者：xxx
+beautifulsoup4==4.13.4
+feedparser==6.0.11
+httpx==0.28.1
+playwright==1.54.0
+PyYAML==6.0.2
+

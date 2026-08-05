@@ -1,0 +1,10 @@
+# 作者：xxx
+.git
+.gitignore
+.env
+config.yaml
+data
+secrets
+__pycache__
+*.pyc
+

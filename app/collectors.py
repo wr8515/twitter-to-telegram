@@ -1,0 +1,442 @@
+"""RSS 与 x.com 推文采集器。
+
+作者：xxx
+"""
+
+import calendar
+import json
+import logging
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
+
+import feedparser
+import httpx
+from bs4 import BeautifulSoup
+from playwright.async_api import Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError, async_playwright
+
+from app.models import AccountConfig, Tweet
+
+
+LOGGER = logging.getLogger(__name__)
+STATUS_PATH_PATTERN = re.compile(r"/([A-Za-z0-9_]+)/status/(\d+)", re.IGNORECASE)
+HANDLE_PATTERN = re.compile(r"@([A-Za-z0-9_]+)")
+
+
+class RssCollector:
+    """从 RSS 或 Atom Feed 中采集原创推文。"""
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        """初始化 RSS 采集器。
+
+        参数:
+            client: 用于请求 Feed 的异步 HTTP 客户端
+        返回:
+            无
+        """
+
+        self._client = client
+
+    async def collect(self, account: AccountConfig) -> list[Tweet]:
+        """采集指定账号的原创推文。
+
+        参数:
+            account: 包含用户名和 Feed 地址的账号配置
+        返回:
+            按推文 ID 从小到大排列的原创推文列表
+        """
+
+        if not account.feed_url:
+            raise ValueError(f"账号 @{account.username} 未配置 feed_url")
+
+        # 1. 【Twitter】【下载并解析中间源 Feed】
+        try:
+            response = await self._client.get(account.feed_url)
+        except httpx.RequestError as error:
+            raise RuntimeError(f"Feed 网络请求失败: {type(error).__name__}") from None
+        if response.is_error:
+            raise RuntimeError(f"Feed HTTP 状态异常: {response.status_code}")
+        feed = feedparser.parse(response.content)
+        if feed.bozo and not feed.entries:
+            raise RuntimeError(f"Feed 解析失败: {feed.bozo_exception}")
+
+        # 2. 【Twitter】【保守筛选能够确认属于该账号的原创推文】
+        tweets: dict[str, Tweet] = {}
+        for entry in feed.entries:
+            tweet = self._parse_entry(entry, account)
+            if tweet is not None:
+                tweets[tweet.tweet_id] = tweet
+
+        return sorted(tweets.values(), key=lambda item: int(item.tweet_id))
+
+    def _parse_entry(self, entry: feedparser.FeedParserDict, account: AccountConfig) -> Tweet | None:
+        """将单个 Feed 条目转换为原创推文。
+
+        参数:
+            entry: feedparser 解析后的条目
+            account: 当前账号配置
+        返回:
+            能够确认是原创推文时返回 Tweet，否则返回空
+        """
+
+        link = str(entry.get("link") or entry.get("id") or "")
+        status_match = STATUS_PATH_PATTERN.search(link)
+        if status_match is None:
+            self._log_skipped(account.username, "缺少可识别的状态链接")
+            return None
+
+        link_author, tweet_id = status_match.groups()
+        if link_author.lower() != account.username.lower():
+            self._log_skipped(account.username, f"状态链接作者为 @{link_author}")
+            return None
+
+        summary = str(entry.get("summary") or entry.get("description") or "")
+        soup = BeautifulSoup(summary, "html.parser")
+        if self._looks_like_non_original(entry, soup):
+            self._log_skipped(account.username, f"推文 {tweet_id} 被识别为回复、转推或引用")
+            return None
+
+        creator = self._extract_creator(entry)
+        if creator is not None and creator.lower() != account.username.lower():
+            self._log_skipped(account.username, f"推文 {tweet_id} 的作者元数据不匹配")
+            return None
+
+        published_at = self._extract_published_at(entry)
+        if published_at is None:
+            self._log_skipped(account.username, f"推文 {tweet_id} 缺少发布时间")
+            return None
+
+        text = self._extract_text(entry, soup)
+        image_url = self._extract_first_image(entry, soup, account.feed_url or "")
+        canonical_url = f"https://x.com/{account.username}/status/{tweet_id}"
+        return Tweet(tweet_id, account.username, text, canonical_url, published_at, image_url)
+
+    @staticmethod
+    def _extract_creator(entry: feedparser.FeedParserDict) -> str | None:
+        """提取 Feed 条目中的作者用户名。
+
+        参数:
+            entry: feedparser 解析后的条目
+        返回:
+            规范化后的用户名，缺少作者元数据时返回空
+        """
+
+        raw_creator = str(entry.get("author") or entry.get("dc_creator") or "").strip()
+        if not raw_creator:
+            return None
+        handles = HANDLE_PATTERN.findall(raw_creator)
+        return handles[-1] if handles else raw_creator.removeprefix("@").strip()
+
+    @staticmethod
+    def _looks_like_non_original(entry: feedparser.FeedParserDict, soup: BeautifulSoup) -> bool:
+        """判断 Feed 条目是否明显属于回复、转推或引用。
+
+        参数:
+            entry: feedparser 解析后的条目
+            soup: 条目 HTML 内容
+        返回:
+            能识别为非原创内容时返回 True
+        """
+
+        title = str(entry.get("title") or "").strip().lower()
+        non_original_prefixes = ("rt by @", "retweeted by @", "reposted by @", "r to @", "replying to @")
+        if title.startswith(non_original_prefixes):
+            return True
+
+        selectors = (
+            ".retweet-header",
+            ".replying-to",
+            ".quote",
+            ".quote-link",
+            ".quoted-tweet",
+            "blockquote",
+        )
+        return any(soup.select_one(selector) is not None for selector in selectors)
+
+    @staticmethod
+    def _extract_published_at(entry: feedparser.FeedParserDict) -> datetime | None:
+        """提取并规范化 Feed 条目的发布时间。
+
+        参数:
+            entry: feedparser 解析后的条目
+        返回:
+            UTC 时区的发布时间，无法解析时返回空
+        """
+
+        parsed_time = entry.get("published_parsed") or entry.get("updated_parsed")
+        if parsed_time is None:
+            return None
+        timestamp = calendar.timegm(parsed_time)
+        return datetime.fromtimestamp(timestamp, tz=UTC)
+
+    @staticmethod
+    def _extract_text(entry: feedparser.FeedParserDict, soup: BeautifulSoup) -> str:
+        """提取推文正文并保留换行。
+
+        参数:
+            entry: feedparser 解析后的条目
+            soup: 条目 HTML 内容
+        返回:
+            清理后的推文正文，图片推文可能为空字符串
+        """
+
+        tweet_node = soup.select_one(".tweet-content")
+        if tweet_node is not None:
+            return tweet_node.get_text("\n", strip=True)
+        return str(entry.get("title") or "").strip()
+
+    @staticmethod
+    def _extract_first_image(
+        entry: feedparser.FeedParserDict,
+        soup: BeautifulSoup,
+        feed_url: str,
+    ) -> str | None:
+        """提取推文第一张非头像图片。
+
+        参数:
+            entry: feedparser 解析后的条目
+            soup: 条目 HTML 内容
+            feed_url: 用于补全相对图片地址的 Feed 地址
+        返回:
+            第一张图片的绝对地址，无图片时返回空
+        """
+
+        # 1. 【Twitter】【优先使用 Feed 标准媒体和附件字段】
+        for media in entry.get("media_content", []) or []:
+            media_url = str(media.get("url") or "")
+            media_kind = str(media.get("medium") or media.get("type") or "").lower()
+            if media_url and ("image" in media_kind or _looks_like_tweet_image(media_url)):
+                return _as_original_image(urljoin(feed_url, media_url))
+        for enclosure in entry.get("enclosures", []) or []:
+            media_url = str(enclosure.get("href") or enclosure.get("url") or "")
+            media_type = str(enclosure.get("type") or "")
+            if media_url and media_type.startswith("image/"):
+                return _as_original_image(urljoin(feed_url, media_url))
+
+        # 2. 【Twitter】【从正文 HTML 中排除头像和表情后取第一张图片】
+        for image in soup.find_all("img"):
+            media_url = str(image.get("src") or "")
+            classes = " ".join(image.get("class") or []).lower()
+            lowered_url = media_url.lower()
+            if not media_url or "avatar" in classes or "profile_images" in lowered_url or "emoji" in classes:
+                continue
+            if not _looks_like_tweet_image(media_url):
+                continue
+            return _as_original_image(urljoin(feed_url, media_url))
+        return None
+
+    @staticmethod
+    def _log_skipped(username: str, reason: str) -> None:
+        """用 info 级别记录被保守过滤的条目。
+
+        参数:
+            username: 当前 Twitter 用户名
+            reason: 跳过条目的原因
+        返回:
+            无
+        """
+
+        LOGGER.info("账号 @%s 跳过无法确认的原创内容：%s", username, reason)
+
+
+class XCollector:
+    """使用带登录 Cookie 的 Chromium 从 x.com 采集原创推文。"""
+
+    def __init__(self, cookie_file: Path) -> None:
+        """初始化 x.com 采集器。
+
+        参数:
+            cookie_file: Playwright storage_state 或 Cookie 数组文件
+        返回:
+            无
+        """
+
+        self._cookie_file = cookie_file
+
+    async def collect(self, account: AccountConfig) -> list[Tweet]:
+        """从账号主页采集当前可见的原创推文。
+
+        参数:
+            account: 当前账号配置
+        返回:
+            按推文 ID 从小到大排列的原创推文列表
+        """
+
+        if not self._cookie_file.is_file():
+            raise FileNotFoundError(f"X Cookie 文件不存在: {self._cookie_file}")
+
+        # 1. 【Twitter】【创建独立浏览器上下文并隔离账号页面状态】
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                context = await self._create_context(browser)
+                try:
+                    return await self._collect_from_page(context, account)
+                finally:
+                    await context.close()
+            finally:
+                await browser.close()
+
+    async def _create_context(self, browser: Browser) -> BrowserContext:
+        """根据 Cookie 文件创建英文界面的浏览器上下文。
+
+        参数:
+            browser: 已启动的 Chromium 浏览器
+        返回:
+            已加载登录 Cookie 的浏览器上下文
+        """
+
+        cookie_data = json.loads(self._cookie_file.read_text(encoding="utf-8"))
+        if isinstance(cookie_data, dict) and isinstance(cookie_data.get("cookies"), list):
+            return await browser.new_context(storage_state=cookie_data, locale="en-US")
+        if not isinstance(cookie_data, list):
+            raise ValueError("X Cookie 文件必须是 Playwright storage_state 对象或 Cookie 数组")
+
+        context = await browser.new_context(locale="en-US")
+        cookies = [self._normalize_cookie(cookie) for cookie in cookie_data]
+        await context.add_cookies(cookies)
+        return context
+
+    @staticmethod
+    def _normalize_cookie(raw_cookie: dict) -> dict:
+        """把常见浏览器导出 Cookie 转换为 Playwright 格式。
+
+        参数:
+            raw_cookie: 浏览器扩展或自动化工具导出的 Cookie 字典
+        返回:
+            Playwright 可接受的 Cookie 字典
+        """
+
+        cookie = {
+            key: raw_cookie[key]
+            for key in ("name", "value", "url", "domain", "path", "expires", "httpOnly", "secure")
+            if key in raw_cookie
+        }
+        if "expires" not in cookie and "expirationDate" in raw_cookie:
+            cookie["expires"] = raw_cookie["expirationDate"]
+        same_site = str(raw_cookie.get("sameSite") or "").lower()
+        same_site_mapping = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+        if same_site in same_site_mapping:
+            cookie["sameSite"] = same_site_mapping[same_site]
+        return cookie
+
+    async def _collect_from_page(self, context: BrowserContext, account: AccountConfig) -> list[Tweet]:
+        """打开账号主页并在有限滚动范围内提取原创推文。
+
+        参数:
+            context: 已登录的浏览器上下文
+            account: 当前账号配置
+        返回:
+            按推文 ID 从小到大排列的原创推文列表
+        """
+
+        page = await context.new_page()
+        try:
+            await page.goto(
+                f"https://x.com/{account.username}",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            await page.wait_for_selector('article[data-testid="tweet"]', timeout=30_000)
+
+            # 1. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
+            tweets: dict[str, Tweet] = {}
+            for _ in range(6):
+                articles = page.locator('article[data-testid="tweet"]')
+                for index in range(await articles.count()):
+                    try:
+                        tweet = await self._parse_article(articles.nth(index), account)
+                    except PlaywrightTimeoutError:
+                        LOGGER.info("账号 @%s 的一个动态推文节点已失效，继续采集", account.username)
+                        continue
+                    if tweet is not None:
+                        tweets[tweet.tweet_id] = tweet
+                await page.mouse.wheel(0, 2_400)
+                await page.wait_for_timeout(1_500)
+
+            return sorted(tweets.values(), key=lambda item: int(item.tweet_id))
+        finally:
+            await page.close()
+
+    @staticmethod
+    async def _parse_article(article, account: AccountConfig) -> Tweet | None:
+        """解析 x.com 页面中的单个推文节点。
+
+        参数:
+            article: Playwright 推文节点定位器
+            account: 当前账号配置
+        返回:
+            能够确认是原创推文时返回 Tweet，否则返回空
+        """
+
+        payload = await article.evaluate(
+            r"""
+            (node, username) => {
+                const pattern = /\/([A-Za-z0-9_]+)\/status\/(\d+)/i;
+                const statusLinks = Array.from(node.querySelectorAll('a[href*="/status/"]'))
+                    .map((link) => link.getAttribute('href') || '')
+                    .map((href) => ({href, match: href.match(pattern)}))
+                    .filter((item) => item.match);
+                const ownLink = statusLinks.find(
+                    (item) => item.match[1].toLowerCase() === username.toLowerCase()
+                );
+                const distinctIds = new Set(statusLinks.map((item) => item.match[2]));
+                const textNode = node.querySelector('[data-testid="tweetText"]');
+                const timeNode = node.querySelector('time');
+                const imageNode = node.querySelector('[data-testid="tweetPhoto"] img');
+                return {
+                    tweetId: ownLink ? ownLink.match[2] : null,
+                    text: textNode ? textNode.innerText : '',
+                    publishedAt: timeNode ? timeNode.getAttribute('datetime') : null,
+                    imageUrl: imageNode ? imageNode.getAttribute('src') : null,
+                    isReply: node.innerText.includes('Replying to'),
+                    hasQuotedStatus: distinctIds.size > 1,
+                };
+            }
+            """,
+            account.username,
+            timeout=2_000,
+        )
+        if not payload["tweetId"] or payload["isReply"] or payload["hasQuotedStatus"]:
+            return None
+        if not payload["publishedAt"]:
+            LOGGER.info("账号 @%s 跳过缺少发布时间的推文 %s", account.username, payload["tweetId"])
+            return None
+
+        published_at = datetime.fromisoformat(str(payload["publishedAt"]).replace("Z", "+00:00"))
+        tweet_id = str(payload["tweetId"])
+        canonical_url = f"https://x.com/{account.username}/status/{tweet_id}"
+        image_url = _as_original_image(str(payload["imageUrl"])) if payload["imageUrl"] else None
+        return Tweet(tweet_id, account.username, str(payload["text"]), canonical_url, published_at, image_url)
+
+
+def _as_original_image(image_url: str) -> str:
+    """把 Twitter 图片地址调整为原图尺寸。
+
+    参数:
+        image_url: RSS 或 x.com 返回的图片地址
+    返回:
+        对 pbs.twimg.com 请求原图后的地址，其他地址保持不变
+    """
+
+    parsed = urlparse(image_url)
+    if parsed.hostname != "pbs.twimg.com":
+        return image_url
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["name"] = "orig"
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _looks_like_tweet_image(image_url: str) -> bool:
+    """判断图片地址是否明确指向 Twitter 推文媒体。
+
+    参数:
+        image_url: Feed HTML 或媒体字段中的图片地址
+    返回:
+        能通过路径确认是推文媒体图片时返回 True
+    """
+
+    normalized_url = unquote(image_url).lower()
+    indicators = ("pbs.twimg.com/media", "/pic/media", "/media/")
+    return "card_img" not in normalized_url and any(item in normalized_url for item in indicators)
