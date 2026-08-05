@@ -2,6 +2,7 @@
 services:
   twitter-to-telegram:
     build: .
+    init: true
     restart: unless-stopped
     environment:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
@@ -24,4 +25,3 @@ secrets:
     file: ./secrets/telegram_bot_token.txt
   x_cookies:
     file: ./secrets/x-cookies.json
-

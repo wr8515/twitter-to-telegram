@@ -3,10 +3,14 @@
 作者：xxx
 """
 
+import asyncio
 import calendar
 import json
 import logging
+import os
 import re
+import signal
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
@@ -22,6 +26,7 @@ from app.models import AccountConfig, Tweet
 LOGGER = logging.getLogger(__name__)
 STATUS_PATH_PATTERN = re.compile(r"/([A-Za-z0-9_]+)/status/(\d+)", re.IGNORECASE)
 HANDLE_PATTERN = re.compile(r"@([A-Za-z0-9_]+)")
+X_COLLECTION_TIMEOUT_SECONDS = 150
 
 
 class RssCollector:
@@ -241,6 +246,92 @@ class RssCollector:
 
 
 class XCollector:
+    """通过独立子进程执行 x.com 采集并提供硬超时保护。"""
+
+    def __init__(self, cookie_file: Path) -> None:
+        """初始化带进程隔离的 x.com 采集器。
+
+        参数:
+            cookie_file: Playwright storage_state 或 Cookie 数组文件
+        返回:
+            无
+        """
+
+        self._cookie_file = cookie_file
+
+    async def collect(self, account: AccountConfig) -> list[Tweet]:
+        """在独立进程中采集账号并限制最长执行时间。
+
+        参数:
+            account: 当前账号配置
+        返回:
+            按推文 ID 从小到大排列的原创推文列表
+        """
+
+        # 1. 【Twitter】【启动独立进程并隔离 Chromium 进程组】
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "app.x_worker",
+            "--username",
+            account.username,
+            "--cookie-file",
+            str(self._cookie_file),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        # 2. 【Twitter】【超时后强制回收采集进程及全部浏览器子进程】
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=X_COLLECTION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            raise TimeoutError(
+                f"账号 @{account.username} 的 x.com 采集超过 {X_COLLECTION_TIMEOUT_SECONDS} 秒"
+            ) from None
+
+        if process.returncode != 0:
+            error_lines = stderr.decode("utf-8", errors="replace").strip().splitlines()
+            error_message = error_lines[-1] if error_lines else "未知错误"
+            raise RuntimeError(f"x.com 采集进程退出码 {process.returncode}: {error_message}")
+
+        return self._decode_tweets(stdout)
+
+    @staticmethod
+    def _decode_tweets(payload: bytes) -> list[Tweet]:
+        """把 worker 返回的 JSON 转换为推文模型。
+
+        参数:
+            payload: worker 标准输出中的 UTF-8 JSON
+        返回:
+            反序列化后的推文列表
+        """
+
+        raw_tweets = json.loads(payload.decode("utf-8"))
+        if not isinstance(raw_tweets, list):
+            raise ValueError("x.com 采集进程返回格式错误")
+        return [
+            Tweet(
+                tweet_id=str(item["tweet_id"]),
+                username=str(item["username"]),
+                text=str(item["text"]),
+                url=str(item["url"]),
+                published_at=datetime.fromisoformat(str(item["published_at"])),
+                image_url=str(item["image_url"]) if item.get("image_url") else None,
+            )
+            for item in raw_tweets
+        ]
+
+
+class XBrowserCollector:
     """使用带登录 Cookie 的 Chromium 从 x.com 采集原创推文。"""
 
     def __init__(self, cookie_file: Path) -> None:
