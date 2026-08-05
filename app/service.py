@@ -17,7 +17,7 @@ import yaml
 from app.collectors import RssCollector, XCollector
 from app.models import AccountConfig, SourceType, Tweet
 from app.state import StateStore
-from app.telegram import TelegramClient
+from app.telegram import TelegramClient, TelegramErrorLogHandler
 
 
 LOGGER = logging.getLogger(__name__)
@@ -101,7 +101,8 @@ class CollectionService:
         """
 
         # 1. 【Twitter】【按账号策略采集原创推文】
-        tweets = await self._collect(account)
+        recent_ids = self._state.recent_ids(account.username)
+        tweets = await self._collect(account, recent_ids)
         LOGGER.info("账号 @%s 采集到 %d 条可确认的原创推文", account.username, len(tweets))
 
         # 2. 【采集服务】【首次启用建立基线并选择最新三条推文】
@@ -126,11 +127,12 @@ class CollectionService:
             await self._deliver(account, tweet)
             await asyncio.sleep(SEND_THROTTLE_SECONDS)
 
-    async def _collect(self, account: AccountConfig) -> list[Tweet]:
+    async def _collect(self, account: AccountConfig, recent_ids: list[str]) -> list[Tweet]:
         """根据账号策略选择 RSS、x.com 或自动回退采集。
 
         参数:
             account: 当前 Twitter 账号配置
+            recent_ids: 用于提前停止网页滚动的最近已处理推文 ID
         返回:
             当前来源可见范围内的原创推文
         """
@@ -138,7 +140,7 @@ class CollectionService:
         if account.source == "rss":
             return await self._rss_collector.collect(account)
         if account.source == "x":
-            return await self._x_collector.collect(account)
+            return await self._x_collector.collect(account, recent_ids)
 
         # 1. 【Twitter】【auto 策略优先使用中间源】
         try:
@@ -147,7 +149,7 @@ class CollectionService:
             LOGGER.error("账号 @%s 的 RSS 采集失败，改用 x.com：%s", account.username, error)
 
         # 2. 【Twitter】【中间源失败后使用 x.com Cookie 兜底】
-        return await self._x_collector.collect(account)
+        return await self._x_collector.collect(account, recent_ids)
 
     async def _deliver(self, account: AccountConfig, tweet: Tweet) -> None:
         """投递单条推文，并更新成功位置或失败次数。
@@ -193,7 +195,7 @@ async def run_service() -> None:
     """
 
     # 1. 【采集服务】【从固定挂载位置加载配置与最小状态】
-    accounts, poll_interval_minutes = load_config(Path("/app/config.yaml"))
+    accounts, poll_interval_minutes, sync_error_logs = load_config(Path("/app/config.yaml"))
     state = StateStore(Path("/app/data/state.json"))
     bot_token = read_secret(Path(_required_environment("TELEGRAM_BOT_TOKEN_FILE")))
     chat_id = _required_environment("TELEGRAM_CHAT_ID")
@@ -203,25 +205,32 @@ async def run_service() -> None:
     timeout = httpx.Timeout(45, connect=20)
     headers = {"User-Agent": "twitter-to-telegram/1.0"}
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        telegram = TelegramClient(client, bot_token, chat_id)
+        if sync_error_logs:
+            logging.getLogger().addHandler(TelegramErrorLogHandler(telegram, asyncio.get_running_loop()))
         service = CollectionService(
             accounts=accounts,
             rss_collector=RssCollector(client),
             x_collector=XCollector(cookie_file),
-            telegram=TelegramClient(client, bot_token, chat_id),
+            telegram=telegram,
             state=state,
             poll_interval_seconds=poll_interval_minutes * 60,
         )
-        LOGGER.info("采集服务启动，轮询间隔为 %d 分钟", poll_interval_minutes)
+        LOGGER.info(
+            "采集服务启动，轮询间隔为 %d 分钟，Telegram 异常日志同步%s",
+            poll_interval_minutes,
+            "已开启" if sync_error_logs else "已关闭",
+        )
         await service.run_forever()
 
 
-def load_config(config_file: Path) -> tuple[list[AccountConfig], int]:
-    """读取并校验 YAML 轮询间隔和账号列表。
+def load_config(config_file: Path) -> tuple[list[AccountConfig], int, bool]:
+    """读取并校验 YAML 轮询间隔、日志同步选项和账号列表。
 
     参数:
         config_file: YAML 配置文件路径
     返回:
-        去重且保持顺序的账号列表，以及轮询间隔分钟数
+        去重且保持顺序的账号列表、轮询间隔分钟数和异常日志同步开关
     """
 
     data = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
@@ -231,6 +240,10 @@ def load_config(config_file: Path) -> tuple[list[AccountConfig], int]:
     poll_interval_minutes = data.get("poll_interval_minutes")
     if type(poll_interval_minutes) is not int or poll_interval_minutes <= 0:
         raise ValueError("poll_interval_minutes 必须是大于 0 的整数")
+
+    sync_error_logs = data.get("sync_error_logs_to_telegram", True)
+    if type(sync_error_logs) is not bool:
+        raise ValueError("sync_error_logs_to_telegram 必须是 true 或 false")
 
     raw_accounts = data.get("accounts")
     if not isinstance(raw_accounts, list) or not raw_accounts:
@@ -259,7 +272,7 @@ def load_config(config_file: Path) -> tuple[list[AccountConfig], int]:
         seen_usernames.add(normalized_username)
         source_type = cast(SourceType, source)
         accounts.append(AccountConfig(username, source_type, feed_url))
-    return accounts, poll_interval_minutes
+    return accounts, poll_interval_minutes, sync_error_logs
 
 
 def read_secret(secret_file: Path) -> str:

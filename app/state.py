@@ -38,6 +38,20 @@ class StateStore:
         account_state = self._data["accounts"].get(username.lower())
         return bool(account_state and account_state.get("initialized_at"))
 
+    def recent_ids(self, username: str) -> list[str]:
+        """读取账号最近 5 个已处理推文 ID 作为采集停止锚点。
+
+        参数:
+            username: Twitter 用户名
+        返回:
+            已初始化账号的最近推文 ID，未初始化时返回空列表
+        """
+
+        account_state = self._data["accounts"].get(username.lower())
+        if not account_state or not account_state.get("initialized_at"):
+            return []
+        return list(account_state.get("recent_ids", []))
+
     def initialize(self, username: str, tweets: list[Tweet]) -> None:
         """首次加入账号时记录当前位置而不投递历史推文。
 

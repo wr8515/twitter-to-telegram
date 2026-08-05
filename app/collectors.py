@@ -18,7 +18,13 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlun
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Route,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from app.models import AccountConfig, Tweet
 
@@ -259,17 +265,18 @@ class XCollector:
 
         self._cookie_file = cookie_file
 
-    async def collect(self, account: AccountConfig) -> list[Tweet]:
+    async def collect(self, account: AccountConfig, stop_ids: list[str] | None = None) -> list[Tweet]:
         """在独立进程中采集账号并限制最长执行时间。
 
         参数:
             account: 当前账号配置
+            stop_ids: 页面出现其中任一 ID 后停止继续滚动
         返回:
             按推文 ID 从小到大排列的原创推文列表
         """
 
         # 1. 【Twitter】【启动独立进程并隔离 Chromium 进程组】
-        process = await asyncio.create_subprocess_exec(
+        command = [
             sys.executable,
             "-m",
             "app.x_worker",
@@ -277,6 +284,11 @@ class XCollector:
             account.username,
             "--cookie-file",
             str(self._cookie_file),
+        ]
+        for stop_id in stop_ids or []:
+            command.extend(("--stop-id", stop_id))
+        process = await asyncio.create_subprocess_exec(
+            *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -345,11 +357,12 @@ class XBrowserCollector:
 
         self._cookie_file = cookie_file
 
-    async def collect(self, account: AccountConfig) -> list[Tweet]:
+    async def collect(self, account: AccountConfig, stop_ids: list[str] | None = None) -> list[Tweet]:
         """从账号主页采集当前可见的原创推文。
 
         参数:
             account: 当前账号配置
+            stop_ids: 页面出现其中任一 ID 后停止继续滚动
         返回:
             按推文 ID 从小到大排列的原创推文列表
         """
@@ -359,11 +372,14 @@ class XBrowserCollector:
 
         # 1. 【Twitter】【创建独立浏览器上下文并隔离账号页面状态】
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=("--disable-gpu", "--disable-software-rasterizer"),
+            )
             try:
                 context = await self._create_context(browser)
                 try:
-                    return await self._collect_from_page(context, account)
+                    return await self._collect_from_page(context, account, set(stop_ids or []))
                 finally:
                     await context.close()
             finally:
@@ -379,14 +395,21 @@ class XBrowserCollector:
         """
 
         cookie_data = json.loads(self._cookie_file.read_text(encoding="utf-8"))
+        context_options = {
+            "locale": "en-US",
+            "viewport": {"width": 900, "height": 700},
+            "device_scale_factor": 1,
+        }
         if isinstance(cookie_data, dict) and isinstance(cookie_data.get("cookies"), list):
-            return await browser.new_context(storage_state=cookie_data, locale="en-US")
-        if not isinstance(cookie_data, list):
+            context = await browser.new_context(storage_state=cookie_data, **context_options)
+        elif isinstance(cookie_data, list):
+            context = await browser.new_context(**context_options)
+            cookies = [self._normalize_cookie(cookie) for cookie in cookie_data]
+            await context.add_cookies(cookies)
+        else:
             raise ValueError("X Cookie 文件必须是 Playwright storage_state 对象或 Cookie 数组")
 
-        context = await browser.new_context(locale="en-US")
-        cookies = [self._normalize_cookie(cookie) for cookie in cookie_data]
-        await context.add_cookies(cookies)
+        await context.route("**/*", _filter_browser_request)
         return context
 
     @staticmethod
@@ -412,12 +435,18 @@ class XBrowserCollector:
             cookie["sameSite"] = same_site_mapping[same_site]
         return cookie
 
-    async def _collect_from_page(self, context: BrowserContext, account: AccountConfig) -> list[Tweet]:
+    async def _collect_from_page(
+        self,
+        context: BrowserContext,
+        account: AccountConfig,
+        stop_ids: set[str],
+    ) -> list[Tweet]:
         """打开账号主页并在有限滚动范围内提取原创推文。
 
         参数:
             context: 已登录的浏览器上下文
             account: 当前账号配置
+            stop_ids: 页面出现其中任一 ID 后停止继续滚动
         返回:
             按推文 ID 从小到大排列的原创推文列表
         """
@@ -443,6 +472,12 @@ class XBrowserCollector:
                         continue
                     if tweet is not None:
                         tweets[tweet.tweet_id] = tweet
+
+                # 2. 【Twitter】【发现状态锚点或取得首次三条后立即停止滚动】
+                found_stop_id = bool(stop_ids.intersection(tweets))
+                enough_for_initialization = not stop_ids and len(tweets) >= 3
+                if found_stop_id or enough_for_initialization or len(tweets) >= 25:
+                    break
                 await page.mouse.wheel(0, 2_400)
                 await page.wait_for_timeout(1_500)
 
@@ -534,3 +569,18 @@ def _looks_like_tweet_image(image_url: str) -> bool:
     normalized_url = unquote(image_url).lower()
     indicators = ("pbs.twimg.com/media", "/pic/media", "/media/")
     return "card_img" not in normalized_url and any(item in normalized_url for item in indicators)
+
+
+async def _filter_browser_request(route: Route) -> None:
+    """阻止不影响 DOM 媒体地址提取的高开销浏览器资源。
+
+    参数:
+        route: Playwright 当前拦截到的网络请求
+    返回:
+        无
+    """
+
+    if route.request.resource_type in {"image", "media", "font"}:
+        await route.abort()
+        return
+    await route.continue_()

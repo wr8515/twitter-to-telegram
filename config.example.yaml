@@ -1,5 +1,6 @@
 # 作者：xxx
 poll_interval_minutes: 10
+sync_error_logs_to_telegram: true
 
 accounts:
   - username: zaobaosg

@@ -3,8 +3,9 @@
 作者：xxx
 """
 
+import asyncio
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -67,6 +68,17 @@ class TelegramClient:
         except Exception as error:
             LOGGER.error("推文 %s 正文已发送，但图片发送失败：%s", tweet.tweet_id, error)
 
+    async def send_error_log(self, message: str) -> None:
+        """向当前频道发送已经格式化的异常日志。
+
+        参数:
+            message: 包含北京时间、来源和异常详情的日志文本
+        返回:
+            无，投递失败时抛出异常
+        """
+
+        await self._send_text(message)
+
     async def _send_text(self, message: str) -> None:
         """按 Telegram 长度限制分段发送正文。
 
@@ -128,6 +140,77 @@ class TelegramClient:
         header = f"@{tweet.username}\n发布时间：{timestamp}（北京时间）"
         body = f"\n\n{tweet.text}" if tweet.text else ""
         return f"{header}{body}\n\n原文：{tweet.url}"
+
+
+class TelegramErrorLogHandler(logging.Handler):
+    """把项目 error 日志异步发送到当前 Telegram 频道。"""
+
+    def __init__(self, telegram: TelegramClient, loop: asyncio.AbstractEventLoop) -> None:
+        """初始化 Telegram 异常日志处理器。
+
+        参数:
+            telegram: 已配置目标频道的 Telegram 客户端
+            loop: 采集服务当前运行的异步事件循环
+        返回:
+            无
+        """
+
+        super().__init__(level=logging.ERROR)
+        self._telegram = telegram
+        self._loop = loop
+        self.setFormatter(logging.Formatter("%(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """筛选项目 error 日志并安排异步投递。
+
+        参数:
+            record: Python logging 生成的日志记录
+        返回:
+            无
+        """
+
+        if not record.name.startswith("app.") or getattr(record, "skip_telegram", False):
+            return
+
+        created_at = datetime.fromtimestamp(record.created, tz=UTC).astimezone(BEIJING_TIMEZONE)
+        message = (
+            "Twitter 采集服务异常\n"
+            f"时间：{_format_beijing_time(created_at)}（北京时间）\n"
+            f"来源：{record.name}\n\n"
+            f"{self.format(record)}"
+        )
+        if not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._schedule, message)
+
+    def _schedule(self, message: str) -> None:
+        """在服务事件循环中创建异常日志投递任务。
+
+        参数:
+            message: 已格式化的异常日志消息
+        返回:
+            无
+        """
+
+        self._loop.create_task(self._send(message))
+
+    async def _send(self, message: str) -> None:
+        """发送异常日志并阻止失败日志再次触发同步。
+
+        参数:
+            message: 已格式化的异常日志消息
+        返回:
+            无
+        """
+
+        # 1. 【Telegram】【同步异常日志并阻断失败递归】
+        try:
+            await self._telegram.send_error_log(message)
+        except Exception as error:
+            LOGGER.error(
+                "异常日志同步到 Telegram 失败：%s",
+                error,
+                extra={"skip_telegram": True},
+            )
 
 
 def _format_beijing_time(value: datetime) -> str:

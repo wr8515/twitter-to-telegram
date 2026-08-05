@@ -24,21 +24,23 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--username", required=True)
     parser.add_argument("--cookie-file", required=True)
+    parser.add_argument("--stop-id", action="append", default=[])
     return parser.parse_args()
 
 
-async def collect(username: str, cookie_file: Path) -> list[Tweet]:
+async def collect(username: str, cookie_file: Path, stop_ids: list[str]) -> list[Tweet]:
     """在当前隔离进程内执行浏览器采集。
 
     参数:
         username: 不带 @ 的 Twitter 用户名
         cookie_file: Playwright Cookie 文件路径
+        stop_ids: 页面出现其中任一 ID 后停止继续滚动
     返回:
         当前页面可见的原创推文列表
     """
 
     account = AccountConfig(username=username, source="x")
-    return await XBrowserCollector(cookie_file).collect(account)
+    return await XBrowserCollector(cookie_file).collect(account, stop_ids)
 
 
 def serialize(tweets: list[Tweet]) -> str:
@@ -74,7 +76,7 @@ def main() -> None:
     """
 
     arguments = parse_arguments()
-    tweets = asyncio.run(collect(arguments.username, Path(arguments.cookie_file)))
+    tweets = asyncio.run(collect(arguments.username, Path(arguments.cookie_file), arguments.stop_id))
     print(serialize(tweets))
 
 
