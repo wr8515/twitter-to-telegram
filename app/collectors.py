@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import base64
 import calendar
 import json
 import logging
@@ -38,6 +39,7 @@ LOGGER = logging.getLogger(__name__)
 STATUS_PATH_PATTERN = re.compile(r"/([A-Za-z0-9_]+)/status/(\d+)", re.IGNORECASE)
 HANDLE_PATTERN = re.compile(r"@([A-Za-z0-9_]+)")
 X_COLLECTION_TIMEOUT_SECONDS = 150
+TRANSPARENT_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
 
 
 class RssCollector:
@@ -740,7 +742,7 @@ def _looks_like_tweet_image(image_url: str) -> bool:
 
 
 async def _filter_browser_request(route: Route) -> None:
-    """阻止不影响 DOM 媒体地址提取的高开销浏览器资源。
+    """使用占位图保留 DOM 图片地址并阻止其他高开销资源。
 
     参数:
         route: Playwright 当前拦截到的网络请求
@@ -748,7 +750,12 @@ async def _filter_browser_request(route: Route) -> None:
         无
     """
 
-    if route.request.resource_type in {"image", "media", "font"}:
+    if route.request.resource_type == "image":
+        # 1. 【Twitter】【避免卡片因图片加载失败移除原始 src 节点】
+        await route.fulfill(status=200, content_type="image/gif", body=TRANSPARENT_GIF)
+        return
+    if route.request.resource_type in {"media", "font"}:
+        # 2. 【Twitter】【阻止不影响推文解析的视频和字体资源】
         await route.abort()
         return
     await route.continue_()
