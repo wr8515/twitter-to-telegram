@@ -21,7 +21,11 @@ from bs4 import BeautifulSoup
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    ConsoleMessage,
+    Error as PlaywrightError,
     Page,
+    Request,
+    Response,
     Route,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
@@ -313,7 +317,10 @@ class XCollector:
 
         if process.returncode != 0:
             error_lines = stderr.decode("utf-8", errors="replace").strip().splitlines()
-            error_message = error_lines[-1] if error_lines else "未知错误"
+            primary_errors = [line.strip() for line in error_lines if "x.com 未加载推文节点" in line]
+            selected_lines = primary_errors[-1:] or error_lines[-6:]
+            error_tail = " | ".join(line.strip() for line in selected_lines if line.strip())
+            error_message = error_tail[-1_200:] if error_tail else "未知错误"
             raise RuntimeError(f"x.com 采集进程退出码 {process.returncode}: {error_message}")
 
         return self._decode_tweets(stdout)
@@ -382,9 +389,17 @@ class XBrowserCollector:
                 try:
                     return await self._collect_from_page(context, account, set(stop_ids or []))
                 finally:
-                    await context.close()
+                    # 2. 【Twitter】【清理已退出的浏览器上下文时不覆盖主错误】
+                    try:
+                        await context.close()
+                    except PlaywrightError:
+                        pass
             finally:
-                await browser.close()
+                # 3. 【Twitter】【清理已退出的 Chromium 时不覆盖主错误】
+                try:
+                    await browser.close()
+                except PlaywrightError:
+                    pass
 
     async def _create_context(self, browser: Browser) -> BrowserContext:
         """根据 Cookie 文件创建英文界面的浏览器上下文。
@@ -453,6 +468,12 @@ class XBrowserCollector:
         """
 
         page = await context.new_page()
+        api_responses: list[Response] = []
+        browser_errors: list[str] = []
+        page.on("response", lambda response: self._record_api_response(api_responses, response))
+        page.on("requestfailed", lambda request: self._record_request_failure(browser_errors, request))
+        page.on("console", lambda message: self._record_console_error(browser_errors, message))
+        page.on("pageerror", lambda error: self._append_diagnostic(browser_errors, f"pageerror={error}"))
         try:
             await page.goto(
                 f"https://x.com/{account.username}",
@@ -467,7 +488,7 @@ class XBrowserCollector:
                     timeout=15_000,
                 )
             except PlaywrightTimeoutError:
-                page_state = await self._describe_page_failure(page)
+                page_state = await self._describe_page_failure(page, api_responses, browser_errors)
                 raise RuntimeError(f"x.com 未加载推文节点：{page_state}") from None
 
             # 2. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
@@ -493,16 +514,114 @@ class XBrowserCollector:
 
             return sorted(tweets.values(), key=lambda item: int(item.tweet_id))
         finally:
-            await page.close()
+            # 4. 【Twitter】【页面已关闭时保留原始采集异常】
+            try:
+                await page.close()
+            except PlaywrightError:
+                pass
 
     @staticmethod
-    async def _describe_page_failure(page: Page) -> str:
+    def _record_api_response(responses: list[Response], response: Response) -> None:
+        """保留最近的 X API 响应以便失败时诊断。
+
+        参数:
+            responses: 当前页面已记录的 API 响应
+            response: Playwright 新收到的响应
+        返回:
+            无
+        """
+
+        if "/graphql/" not in response.url and "/i/api/" not in response.url:
+            return
+        responses.append(response)
+        del responses[:-8]
+
+    @staticmethod
+    def _record_request_failure(errors: list[str], request: Request) -> None:
+        """记录 X API、页面或脚本的网络失败。
+
+        参数:
+            errors: 当前页面已记录的浏览器错误
+            request: Playwright 报告失败的请求
+        返回:
+            无
+        """
+
+        is_api = "/graphql/" in request.url or "/i/api/" in request.url
+        if not is_api and request.resource_type not in {"document", "script"}:
+            return
+        path = urlparse(request.url).path.rsplit("/", 1)[-1][:80]
+        XBrowserCollector._append_diagnostic(
+            errors,
+            f"requestfailed={request.resource_type}:{path}:{request.failure or '未知原因'}",
+        )
+
+    @staticmethod
+    def _record_console_error(errors: list[str], message: ConsoleMessage) -> None:
+        """记录页面控制台的 error 级别摘要。
+
+        参数:
+            errors: 当前页面已记录的浏览器错误
+            message: Playwright 页面控制台消息
+        返回:
+            无
+        """
+
+        if message.type == "error" and "Failed to load resource" not in message.text:
+            XBrowserCollector._append_diagnostic(errors, f"console={message.text[:180]}")
+
+    @staticmethod
+    def _append_diagnostic(items: list[str], item: str) -> None:
+        """追加一条定长浏览器诊断信息。
+
+        参数:
+            items: 诊断信息列表
+            item: 本次追加的诊断文本
+        返回:
+            无
+        """
+
+        items.append(re.sub(r"\s+", " ", item).strip())
+        del items[:-6]
+
+    @staticmethod
+    async def _summarize_api_response(response: Response) -> str:
+        """提取单个 X API 响应的操作名、状态和错误摘要。
+
+        参数:
+            response: 待摘要的 Playwright API 响应
+        返回:
+            不包含请求头和 Cookie 的单行诊断文本
+        """
+
+        operation = urlparse(response.url).path.rsplit("/", 1)[-1][:80] or "unknown"
+        result = f"{operation}={response.status}"
+        try:
+            body = await asyncio.wait_for(response.text(), timeout=1)
+            payload = json.loads(body)
+        except Exception:
+            return result
+        if isinstance(payload, dict) and payload.get("errors"):
+            error_text = json.dumps(payload["errors"], ensure_ascii=False, separators=(",", ":"))
+            return f"{result}:{error_text[:220]}"
+        if isinstance(payload, dict) and payload.get("data") is None:
+            return f"{result}:data=null"
+        return f"{result}:data=ok"
+
+    @staticmethod
+    async def _describe_page_failure(
+        page: Page,
+        api_responses: list[Response],
+        browser_errors: list[str],
+    ) -> str:
         """提取 x.com 页面的有限诊断信息。
 
         参数:
             page: 未加载出推文节点的 Playwright 页面
+            api_responses: 最近的 X API 响应
+            browser_errors: 最近的页面脚本和请求错误
         返回:
-            包含当前 URL、标题和简短页面提示的诊断文本
+            包含 URL、标题、页面提示和 API 状态的诊断文本
         """
 
         # 1. 【Twitter】【限制诊断文本长度以避免异常日志过大】
@@ -515,7 +634,15 @@ class XBrowserCollector:
             body_summary = re.sub(r"\s+", " ", body_text).strip()[:300]
         except Exception:
             body_summary = "无法读取"
-        return f"url={page.url}，title={title!r}，page={body_summary!r}"
+        api_summaries = await asyncio.gather(
+            *(XBrowserCollector._summarize_api_response(response) for response in api_responses[-6:])
+        )
+        api_summary = " | ".join(api_summaries) or "未捕获到 X API 响应"
+        error_summary = " | ".join(browser_errors[-4:]) or "未捕获到浏览器错误"
+        return (
+            f"url={page.url}，title={title!r}，page={body_summary!r}，"
+            f"api={api_summary}，browser={error_summary}"
+        )
 
     @staticmethod
     async def _parse_article(article, account: AccountConfig) -> Tweet | None:
