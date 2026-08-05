@@ -23,6 +23,7 @@ from app.telegram import TelegramClient
 LOGGER = logging.getLogger(__name__)
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 MAX_TWEETS_PER_ACCOUNT = 20
+INITIAL_TWEETS_TO_SEND = 3
 SEND_THROTTLE_SECONDS = 1
 
 
@@ -103,14 +104,19 @@ class CollectionService:
         tweets = await self._collect(account)
         LOGGER.info("账号 @%s 采集到 %d 条可确认的原创推文", account.username, len(tweets))
 
-        # 2. 【采集服务】【首次启用只建立基线，不发送历史推文】
+        # 2. 【采集服务】【首次启用建立基线并选择最新三条推文】
         if not self._state.is_initialized(account.username):
-            self._state.initialize(account.username, tweets)
-            LOGGER.info("账号 @%s 已建立首次基线，未发送历史推文", account.username)
-            return
-
-        # 3. 【采集服务】【按发布时间选取增量和待重试推文】
-        candidates = self._state.candidates(account.username, tweets, MAX_TWEETS_PER_ACCOUNT)
+            baseline_tweets = tweets[:-INITIAL_TWEETS_TO_SEND]
+            candidates = tweets[-INITIAL_TWEETS_TO_SEND:]
+            self._state.initialize(account.username, baseline_tweets)
+            LOGGER.info(
+                "账号 @%s 已建立首次基线，准备发送最新 %d 条推文",
+                account.username,
+                len(candidates),
+            )
+        else:
+            # 3. 【采集服务】【按发布时间选取增量和待重试推文】
+            candidates = self._state.candidates(account.username, tweets, MAX_TWEETS_PER_ACCOUNT)
         if not candidates:
             LOGGER.info("账号 @%s 本轮没有待发送推文", account.username)
             return
