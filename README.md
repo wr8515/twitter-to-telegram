@@ -6,7 +6,7 @@
 
 ## 已实现规则
 
-- 容器启动后立即采集，之后每 30 分钟执行一轮
+- 容器启动后立即采集，之后按 YAML 配置的间隔执行，示例默认为每 10 分钟一轮
 - 每账号配置 `rss`、`x` 或 `auto` 策略
 - `auto` 先请求 RSS，中间源请求或解析失败时使用 `x.com`
 - 只发送能够确认的原创推文，跳过回复、转推和引用推文
@@ -31,6 +31,8 @@ mkdir -p data secrets
 编辑 `config.yaml`：
 
 ```yaml
+poll_interval_minutes: 10
+
 accounts:
   - username: zaobaosg
     source: auto
@@ -49,6 +51,8 @@ accounts:
 - `rss`：只使用当前账号的 `feed_url`
 - `x`：只使用带登录 Cookie 的 `x.com` 页面
 - `auto`：优先使用 `feed_url`，请求或解析报错时回退到 `x.com`
+
+`poll_interval_minutes` 必须是大于 `0` 的整数，修改后需要重启容器生效。
 
 修改账号配置后执行以下命令重启容器，新的账号首次成功采集只建立基线，不发送历史内容：
 

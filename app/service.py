@@ -22,7 +22,6 @@ from app.telegram import TelegramClient
 
 LOGGER = logging.getLogger(__name__)
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
-POLL_INTERVAL_SECONDS = 30 * 60
 MAX_TWEETS_PER_ACCOUNT = 20
 SEND_THROTTLE_SECONDS = 1
 
@@ -37,6 +36,7 @@ class CollectionService:
         x_collector: XCollector,
         telegram: TelegramClient,
         state: StateStore,
+        poll_interval_seconds: int,
     ) -> None:
         """初始化采集服务。
 
@@ -46,6 +46,7 @@ class CollectionService:
             x_collector: x.com 网页采集器
             telegram: Telegram 频道投递客户端
             state: 最近位置和失败次数状态存储
+            poll_interval_seconds: 两轮采集开始时间之间的秒数
         返回:
             无
         """
@@ -55,9 +56,10 @@ class CollectionService:
         self._x_collector = x_collector
         self._telegram = telegram
         self._state = state
+        self._poll_interval_seconds = poll_interval_seconds
 
     async def run_forever(self) -> None:
-        """启动立即采集，并保持每 30 分钟执行一轮。
+        """启动立即采集，并按配置间隔持续执行。
 
         参数:
             无
@@ -69,7 +71,7 @@ class CollectionService:
             cycle_started = monotonic()
             await self._run_cycle()
             elapsed = monotonic() - cycle_started
-            await asyncio.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
+            await asyncio.sleep(max(0, self._poll_interval_seconds - elapsed))
 
     async def _run_cycle(self) -> None:
         """顺序处理一轮所有账号，隔离单账号异常。
@@ -185,7 +187,7 @@ async def run_service() -> None:
     """
 
     # 1. 【采集服务】【从固定挂载位置加载配置与最小状态】
-    accounts = load_accounts(Path("/app/config.yaml"))
+    accounts, poll_interval_minutes = load_config(Path("/app/config.yaml"))
     state = StateStore(Path("/app/data/state.json"))
     bot_token = read_secret(Path(_required_environment("TELEGRAM_BOT_TOKEN_FILE")))
     chat_id = _required_environment("TELEGRAM_CHAT_ID")
@@ -201,20 +203,29 @@ async def run_service() -> None:
             x_collector=XCollector(cookie_file),
             telegram=TelegramClient(client, bot_token, chat_id),
             state=state,
+            poll_interval_seconds=poll_interval_minutes * 60,
         )
+        LOGGER.info("采集服务启动，轮询间隔为 %d 分钟", poll_interval_minutes)
         await service.run_forever()
 
 
-def load_accounts(config_file: Path) -> list[AccountConfig]:
-    """读取并校验 YAML 账号列表。
+def load_config(config_file: Path) -> tuple[list[AccountConfig], int]:
+    """读取并校验 YAML 轮询间隔和账号列表。
 
     参数:
         config_file: YAML 配置文件路径
     返回:
-        去重且保持配置顺序的账号列表
+        去重且保持顺序的账号列表，以及轮询间隔分钟数
     """
 
     data = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError("config.yaml 顶层必须是对象")
+
+    poll_interval_minutes = data.get("poll_interval_minutes")
+    if type(poll_interval_minutes) is not int or poll_interval_minutes <= 0:
+        raise ValueError("poll_interval_minutes 必须是大于 0 的整数")
+
     raw_accounts = data.get("accounts")
     if not isinstance(raw_accounts, list) or not raw_accounts:
         raise ValueError("config.yaml 必须包含非空 accounts 列表")
@@ -242,7 +253,7 @@ def load_accounts(config_file: Path) -> list[AccountConfig]:
         seen_usernames.add(normalized_username)
         source_type = cast(SourceType, source)
         accounts.append(AccountConfig(username, source_type, feed_url))
-    return accounts
+    return accounts, poll_interval_minutes
 
 
 def read_secret(secret_file: Path) -> str:

@@ -1,4 +1,6 @@
 # 作者：xxx
+poll_interval_minutes: 10
+
 accounts:
   - username: zaobaosg
     source: auto
@@ -10,4 +12,3 @@ accounts:
 
   - username: example_account
     source: x
-
