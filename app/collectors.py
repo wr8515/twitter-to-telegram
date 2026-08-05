@@ -381,8 +381,13 @@ class XBrowserCollector:
         # 1. 【Twitter】【创建独立浏览器上下文并隔离账号页面状态】
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
+                channel="chromium",
                 headless=True,
-                args=("--disable-gpu",),
+                args=(
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--renderer-process-limit=2",
+                ),
             )
             try:
                 context = await self._create_context(browser)
@@ -415,6 +420,10 @@ class XBrowserCollector:
             "locale": "en-US",
             "viewport": {"width": 900, "height": 700},
             "device_scale_factor": 1,
+            "user_agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            ),
         }
         if isinstance(cookie_data, dict) and isinstance(cookie_data.get("cookies"), list):
             context = await browser.new_context(storage_state=cookie_data, **context_options)
@@ -485,7 +494,7 @@ class XBrowserCollector:
                 await page.wait_for_selector(
                     'article[data-testid="tweet"]',
                     state="attached",
-                    timeout=15_000,
+                    timeout=30_000,
                 )
             except PlaywrightTimeoutError:
                 page_state = await self._describe_page_failure(page, api_responses, browser_errors)

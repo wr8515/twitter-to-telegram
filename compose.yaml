@@ -5,8 +5,8 @@ services:
     init: true
     restart: unless-stopped
     cpus: 0.75
-    mem_limit: 768m
-    pids_limit: 128
+    mem_limit: 896m
+    pids_limit: 160
     environment:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
