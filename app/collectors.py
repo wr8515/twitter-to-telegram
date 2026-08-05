@@ -681,14 +681,22 @@ class XBrowserCollector:
                 const textNode = node.querySelector('[data-testid="tweetText"]');
                 const timeNode = node.querySelector('time');
                 const imageNode = node.querySelector('[data-testid="tweetPhoto"] img');
-                const cardImageNode = node.querySelector('[data-testid="card.wrapper"] img');
+                const cardWrapper = node.querySelector('[data-testid="card.wrapper"]');
+                const cardImageNode = cardWrapper?.querySelector('img');
+                const cardBackgroundUrl = cardWrapper
+                    ? [cardWrapper, ...cardWrapper.querySelectorAll('*')]
+                        .map((element) => getComputedStyle(element).backgroundImage)
+                        .filter((background) => background && background !== 'none')
+                        .map((background) => background.match(/^url\(["']?(.*?)["']?\)$/)?.[1] || null)
+                        .find((url) => url)
+                    : null;
                 return {
                     tweetId: ownLink ? ownLink.match[2] : null,
                     text: textNode ? textNode.innerText : '',
                     publishedAt: timeNode ? timeNode.getAttribute('datetime') : null,
                     imageUrl: imageNode
                         ? imageNode.getAttribute('src')
-                        : cardImageNode?.getAttribute('src') || null,
+                        : cardImageNode?.getAttribute('src') || cardBackgroundUrl || null,
                     isReply: node.innerText.includes('Replying to'),
                     hasQuotedStatus: distinctIds.size > 1,
                 };
