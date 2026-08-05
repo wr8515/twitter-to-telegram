@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    Page,
     Route,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
@@ -374,7 +375,7 @@ class XBrowserCollector:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
                 headless=True,
-                args=("--disable-gpu", "--disable-software-rasterizer"),
+                args=("--disable-gpu",),
             )
             try:
                 context = await self._create_context(browser)
@@ -458,9 +459,18 @@ class XBrowserCollector:
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-            await page.wait_for_selector('article[data-testid="tweet"]', timeout=30_000)
+            try:
+                # 1. 【Twitter】【只等待推文节点挂载而不依赖无头浏览器可见性计算】
+                await page.wait_for_selector(
+                    'article[data-testid="tweet"]',
+                    state="attached",
+                    timeout=15_000,
+                )
+            except PlaywrightTimeoutError:
+                page_state = await self._describe_page_failure(page)
+                raise RuntimeError(f"x.com 未加载推文节点：{page_state}") from None
 
-            # 1. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
+            # 2. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
             tweets: dict[str, Tweet] = {}
             for _ in range(6):
                 articles = page.locator('article[data-testid="tweet"]')
@@ -473,7 +483,7 @@ class XBrowserCollector:
                     if tweet is not None:
                         tweets[tweet.tweet_id] = tweet
 
-                # 2. 【Twitter】【发现状态锚点或取得首次三条后立即停止滚动】
+                # 3. 【Twitter】【发现状态锚点或取得首次三条后立即停止滚动】
                 found_stop_id = bool(stop_ids.intersection(tweets))
                 enough_for_initialization = not stop_ids and len(tweets) >= 3
                 if found_stop_id or enough_for_initialization or len(tweets) >= 25:
@@ -484,6 +494,28 @@ class XBrowserCollector:
             return sorted(tweets.values(), key=lambda item: int(item.tweet_id))
         finally:
             await page.close()
+
+    @staticmethod
+    async def _describe_page_failure(page: Page) -> str:
+        """提取 x.com 页面的有限诊断信息。
+
+        参数:
+            page: 未加载出推文节点的 Playwright 页面
+        返回:
+            包含当前 URL、标题和简短页面提示的诊断文本
+        """
+
+        # 1. 【Twitter】【限制诊断文本长度以避免异常日志过大】
+        try:
+            title = await page.title()
+        except Exception:
+            title = "无法读取"
+        try:
+            body_text = await page.locator("body").inner_text(timeout=2_000)
+            body_summary = re.sub(r"\s+", " ", body_text).strip()[:300]
+        except Exception:
+            body_summary = "无法读取"
+        return f"url={page.url}，title={title!r}，page={body_summary!r}"
 
     @staticmethod
     async def _parse_article(article, account: AccountConfig) -> Tweet | None:
