@@ -703,22 +703,29 @@ class XBrowserCollector:
                 const textNode = node.querySelector('[data-testid="tweetText"]');
                 const timeNode = node.querySelector('time');
                 const imageNode = node.querySelector('[data-testid="tweetPhoto"] img');
-                const cardWrapper = node.querySelector('[data-testid="card.wrapper"]');
-                const cardImageNode = cardWrapper?.querySelector('img');
-                const cardBackgroundUrl = cardWrapper
-                    ? [cardWrapper, ...cardWrapper.querySelectorAll('*')]
+                const cardRoots = [
+                    ...node.querySelectorAll('[data-testid^="card."]'),
+                    ...node.querySelectorAll('a[href^="https://t.co/"]'),
+                ];
+                const cardImageNode = cardRoots
+                    .map((root) => root.matches('img') ? root : root.querySelector('img'))
+                    .find((image) => image);
+                const cardBackgroundUrl = cardRoots
+                    .flatMap((root) => [root, ...root.querySelectorAll('*')])
                         .map((element) => getComputedStyle(element).backgroundImage)
                         .filter((background) => background && background !== 'none')
                         .map((background) => background.match(/^url\(["']?(.*?)["']?\)$/)?.[1] || null)
-                        .find((url) => url)
-                    : null;
+                        .find((url) => url) || null;
                 return {
                     tweetId: ownLink ? ownLink.match[2] : null,
                     text: textNode ? textNode.innerText : '',
                     publishedAt: timeNode ? timeNode.getAttribute('datetime') : null,
                     imageUrl: imageNode
                         ? imageNode.getAttribute('src')
-                        : cardImageNode?.getAttribute('src') || cardBackgroundUrl || null,
+                        : cardImageNode?.getAttribute('src')
+                            || cardImageNode?.getAttribute('data-src')
+                            || cardBackgroundUrl
+                            || null,
                     isReply: node.innerText.includes('Replying to'),
                     hasQuotedStatus: distinctIds.size > 1,
                 };
