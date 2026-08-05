@@ -385,11 +385,14 @@ class XCollector:
                 const textNode = node.querySelector('[data-testid="tweetText"]');
                 const timeNode = node.querySelector('time');
                 const imageNode = node.querySelector('[data-testid="tweetPhoto"] img');
+                const cardImageNode = node.querySelector('[data-testid="card.wrapper"] img');
                 return {
                     tweetId: ownLink ? ownLink.match[2] : null,
                     text: textNode ? textNode.innerText : '',
                     publishedAt: timeNode ? timeNode.getAttribute('datetime') : null,
-                    imageUrl: imageNode ? imageNode.getAttribute('src') : null,
+                    imageUrl: imageNode
+                        ? imageNode.getAttribute('src')
+                        : cardImageNode?.getAttribute('src') || null,
                     isReply: node.innerText.includes('Replying to'),
                     hasQuotedStatus: distinctIds.size > 1,
                 };
