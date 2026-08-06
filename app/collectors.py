@@ -38,7 +38,8 @@ from app.models import AccountConfig, Tweet
 LOGGER = logging.getLogger(__name__)
 STATUS_PATH_PATTERN = re.compile(r"/([A-Za-z0-9_]+)/status/(\d+)", re.IGNORECASE)
 HANDLE_PATTERN = re.compile(r"@([A-Za-z0-9_]+)")
-X_COLLECTION_TIMEOUT_SECONDS = 150
+X_COLLECTION_TIMEOUT_SECONDS = 75
+X_COLLECTION_ATTEMPTS = 2
 TRANSPARENT_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
 
 
@@ -282,7 +283,7 @@ class XCollector:
             按推文 ID 从小到大排列的原创推文列表
         """
 
-        # 1. 【Twitter】【启动独立进程并隔离 Chromium 进程组】
+        # 1. 【Twitter】【准备独立采集进程参数】
         command = [
             sys.executable,
             "-m",
@@ -294,38 +295,51 @@ class XCollector:
         ]
         for stop_id in stop_ids or []:
             command.extend(("--stop-id", stop_id))
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
 
-        # 2. 【Twitter】【超时后强制回收采集进程及全部浏览器子进程】
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=X_COLLECTION_TIMEOUT_SECONDS,
+        attempt = 1
+        while True:
+            # 2. 【Twitter】【每次尝试使用全新进程组隔离 Chromium】
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
-        except TimeoutError:
+
+            # 3. 【Twitter】【超时后强制回收采集进程及全部浏览器子进程】
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await process.wait()
-            raise TimeoutError(
-                f"账号 @{account.username} 的 x.com 采集超过 {X_COLLECTION_TIMEOUT_SECONDS} 秒"
-            ) from None
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=X_COLLECTION_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+                if attempt >= X_COLLECTION_ATTEMPTS:
+                    raise TimeoutError(
+                        f"账号 @{account.username} 的 x.com 采集连续 {attempt} 次超过 "
+                        f"{X_COLLECTION_TIMEOUT_SECONDS} 秒"
+                    ) from None
+                LOGGER.info(
+                    "账号 @%s 的 x.com 第 %d 次采集超时，回收浏览器后重试",
+                    account.username,
+                    attempt,
+                )
+                attempt += 1
+                continue
 
-        if process.returncode != 0:
-            error_lines = stderr.decode("utf-8", errors="replace").strip().splitlines()
-            primary_errors = [line.strip() for line in error_lines if "x.com 未加载推文节点" in line]
-            selected_lines = primary_errors[-1:] or error_lines[-6:]
-            error_tail = " | ".join(line.strip() for line in selected_lines if line.strip())
-            error_message = error_tail[-1_200:] if error_tail else "未知错误"
-            raise RuntimeError(f"x.com 采集进程退出码 {process.returncode}: {error_message}")
+            if process.returncode != 0:
+                error_lines = stderr.decode("utf-8", errors="replace").strip().splitlines()
+                primary_errors = [line.strip() for line in error_lines if "x.com 未加载推文节点" in line]
+                selected_lines = primary_errors[-1:] or error_lines[-6:]
+                error_tail = " | ".join(line.strip() for line in selected_lines if line.strip())
+                error_message = error_tail[-1_200:] if error_tail else "未知错误"
+                raise RuntimeError(f"x.com 采集进程退出码 {process.returncode}: {error_message}")
 
-        return self._decode_tweets(stdout)
+            return self._decode_tweets(stdout)
 
     @staticmethod
     def _decode_tweets(payload: bytes) -> list[Tweet]:
