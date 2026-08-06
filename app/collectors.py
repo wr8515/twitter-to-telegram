@@ -688,12 +688,32 @@ class XBrowserCollector:
                 const cardImageNode = cardRoots
                     .map((root) => root.matches('img') ? root : root.querySelector('img'))
                     .find((image) => image);
+                const largeImageNode = Array.from(node.querySelectorAll('img'))
+                    .map((image) => ({image, rect: image.getBoundingClientRect()}))
+                    .filter((item) => item.rect.width >= 120 && item.rect.height >= 80)
+                    .sort((left, right) =>
+                        right.rect.width * right.rect.height - left.rect.width * left.rect.height
+                    )[0]?.image || null;
                 const cardBackgroundUrl = cardRoots
                     .flatMap((root) => [root, ...root.querySelectorAll('*')])
                         .map((element) => getComputedStyle(element).backgroundImage)
                         .filter((background) => background && background !== 'none')
                         .map((background) => background.match(/^url\(["']?(.*?)["']?\)$/)?.[1] || null)
                         .find((url) => url) || null;
+                const largeBackgroundUrl = Array.from(node.querySelectorAll('*'))
+                    .map((element) => ({
+                        background: getComputedStyle(element).backgroundImage,
+                        rect: element.getBoundingClientRect(),
+                    }))
+                    .filter((item) =>
+                        item.background && item.background !== 'none'
+                        && item.rect.width >= 120 && item.rect.height >= 80
+                    )
+                    .sort((left, right) =>
+                        right.rect.width * right.rect.height - left.rect.width * left.rect.height
+                    )
+                    .map((item) => item.background.match(/^url\(["']?(.*?)["']?\)$/)?.[1] || null)
+                    .find((url) => url) || null;
                 return {
                     tweetId: ownLink ? ownLink.match[2] : null,
                     text: textNode ? textNode.innerText : '',
@@ -702,7 +722,10 @@ class XBrowserCollector:
                         ? imageNode.getAttribute('src')
                         : cardImageNode?.getAttribute('src')
                             || cardImageNode?.getAttribute('data-src')
+                            || largeImageNode?.getAttribute('src')
+                            || largeImageNode?.getAttribute('data-src')
                             || cardBackgroundUrl
+                            || largeBackgroundUrl
                             || null,
                     isReply: node.innerText.includes('Replying to'),
                     hasQuotedStatus: distinctIds.size > 1,
