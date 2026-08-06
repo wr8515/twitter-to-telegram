@@ -337,6 +337,14 @@ class XCollector:
                 selected_lines = primary_errors[-1:] or error_lines[-6:]
                 error_tail = " | ".join(line.strip() for line in selected_lines if line.strip())
                 error_message = error_tail[-1_200:] if error_tail else "未知错误"
+                if primary_errors and attempt < X_COLLECTION_ATTEMPTS:
+                    LOGGER.info(
+                        "账号 @%s 的 x.com 第 %d 次未加载时间线，回收浏览器后重试",
+                        account.username,
+                        attempt,
+                    )
+                    attempt += 1
+                    continue
                 raise RuntimeError(f"x.com 采集进程退出码 {process.returncode}: {error_message}")
 
             return self._decode_tweets(stdout)
