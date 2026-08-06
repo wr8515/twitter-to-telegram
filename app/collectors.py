@@ -656,28 +656,6 @@ class XBrowserCollector:
         )
 
     @staticmethod
-    async def _describe_page_failure(page: Page) -> str:
-        """提取 x.com 页面的有限诊断信息。
-
-        参数:
-            page: 未加载出推文节点的 Playwright 页面
-        返回:
-            包含当前 URL、标题和简短页面提示的诊断文本
-        """
-
-        # 1. 【Twitter】【限制诊断文本长度以避免异常日志过大】
-        try:
-            title = await page.title()
-        except Exception:
-            title = "无法读取"
-        try:
-            body_text = await page.locator("body").inner_text(timeout=2_000)
-            body_summary = re.sub(r"\s+", " ", body_text).strip()[:300]
-        except Exception:
-            body_summary = "无法读取"
-        return f"url={page.url}，title={title!r}，page={body_summary!r}"
-
-    @staticmethod
     async def _parse_article(article, account: AccountConfig) -> Tweet | None:
         """解析 x.com 页面中的单个推文节点。
 
