@@ -498,11 +498,13 @@ class XBrowserCollector:
                     state="attached",
                     timeout=30_000,
                 )
+                # 2. 【Twitter】【等待首屏外链卡片完成异步渲染后再提取图片】
+                await page.wait_for_timeout(3_000)
             except PlaywrightTimeoutError:
                 page_state = await self._describe_page_failure(page, api_responses, browser_errors)
                 raise RuntimeError(f"x.com 未加载推文节点：{page_state}") from None
 
-            # 2. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
+            # 3. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
             tweets: dict[str, Tweet] = {}
             for _ in range(6):
                 articles = page.locator('article[data-testid="tweet"]')
@@ -515,7 +517,7 @@ class XBrowserCollector:
                     if tweet is not None:
                         tweets[tweet.tweet_id] = tweet
 
-                # 3. 【Twitter】【发现状态锚点或取得首次三条后立即停止滚动】
+                # 4. 【Twitter】【发现状态锚点或取得首次三条后立即停止滚动】
                 found_stop_id = bool(stop_ids.intersection(tweets))
                 enough_for_initialization = not stop_ids and len(tweets) >= 3
                 if found_stop_id or enough_for_initialization or len(tweets) >= 25:
@@ -525,7 +527,7 @@ class XBrowserCollector:
 
             return sorted(tweets.values(), key=lambda item: int(item.tweet_id))
         finally:
-            # 4. 【Twitter】【页面已关闭时保留原始采集异常】
+            # 5. 【Twitter】【页面已关闭时保留原始采集异常】
             try:
                 await page.close()
             except PlaywrightError:
