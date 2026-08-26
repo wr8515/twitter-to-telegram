@@ -703,6 +703,15 @@ class XBrowserCollector:
                 );
                 const distinctIds = new Set(statusLinks.map((item) => item.match[2]));
                 const textNode = node.querySelector('[data-testid="tweetText"]');
+                // 1. 【Twitter】【从正文副本中删除外部链接节点】
+                const cleanedTextNode = textNode ? textNode.cloneNode(true) : null;
+                if (cleanedTextNode) {
+                    cleanedTextNode.querySelectorAll('a[href^="http://"], a[href^="https://"]')
+                        .forEach((link) => link.remove());
+                    // 2. 【Twitter】【保留正文原有的显式换行】
+                    cleanedTextNode.querySelectorAll('br')
+                        .forEach((lineBreak) => lineBreak.replaceWith('\n'));
+                }
                 const timeNode = node.querySelector('time');
                 const imageNode = node.querySelector('[data-testid="tweetPhoto"] img');
                 const cardRoots = [
@@ -740,7 +749,7 @@ class XBrowserCollector:
                     .find((url) => url) || null;
                 return {
                     tweetId: ownLink ? ownLink.match[2] : null,
-                    text: textNode ? textNode.innerText : '',
+                    text: cleanedTextNode ? cleanedTextNode.textContent.trim() : '',
                     publishedAt: timeNode ? timeNode.getAttribute('datetime') : null,
                     imageUrl: imageNode
                         ? imageNode.getAttribute('src')
