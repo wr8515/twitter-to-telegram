@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import re
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ LOGGER = logging.getLogger(__name__)
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 MESSAGE_LIMIT = 4096
 CAPTION_LIMIT = 1024
+URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 class TelegramClient:
@@ -138,7 +140,8 @@ class TelegramClient:
         published_at = tweet.published_at.astimezone(BEIJING_TIMEZONE)
         timestamp = _format_beijing_time(published_at)
         header = f"@{tweet.username}\n发布时间：{timestamp}（北京时间）"
-        body = f"\n\n{tweet.text}" if tweet.text else ""
+        cleaned_text = _remove_body_urls(tweet.text)
+        body = f"\n\n{cleaned_text}" if cleaned_text else ""
         return f"{header}{body}\n\n原文：{tweet.url}"
 
 
@@ -211,6 +214,23 @@ class TelegramErrorLogHandler(logging.Handler):
                 error,
                 extra={"skip_telegram": True},
             )
+
+
+def _remove_body_urls(text: str) -> str:
+    """移除推文正文中的网页链接并整理空行。
+
+    参数:
+        text: 采集到的推文正文
+    返回:
+        保留非链接文字且不含连续多余空行的正文
+    """
+
+    # 1. 【Telegram】【删除正文链接并清理链接两侧空白】
+    cleaned_lines = [URL_PATTERN.sub("", line).strip() for line in text.splitlines()]
+
+    # 2. 【Telegram】【折叠删除整行链接后产生的连续空行】
+    cleaned_text = "\n".join(cleaned_lines).strip()
+    return re.sub(r"\n{3,}", "\n\n", cleaned_text)
 
 
 def _format_beijing_time(value: datetime) -> str:
