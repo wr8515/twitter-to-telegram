@@ -703,12 +703,9 @@ class XBrowserCollector:
                 );
                 const distinctIds = new Set(statusLinks.map((item) => item.match[2]));
                 const textNode = node.querySelector('[data-testid="tweetText"]');
-                // 1. 【Twitter】【从正文副本中删除外部链接节点】
                 const cleanedTextNode = textNode ? textNode.cloneNode(true) : null;
                 if (cleanedTextNode) {
-                    cleanedTextNode.querySelectorAll('a[href^="http://"], a[href^="https://"]')
-                        .forEach((link) => link.remove());
-                    // 2. 【Twitter】【保留正文原有的显式换行】
+                    // 1. 【Twitter】【保留正文原有的显式换行并避免视觉折行进入文本】
                     cleanedTextNode.querySelectorAll('br')
                         .forEach((lineBreak) => lineBreak.replaceWith('\n'));
                 }
