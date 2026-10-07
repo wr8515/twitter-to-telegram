@@ -38,7 +38,7 @@ from app.models import AccountConfig, Tweet
 LOGGER = logging.getLogger(__name__)
 STATUS_PATH_PATTERN = re.compile(r"/([A-Za-z0-9_]+)/status/(\d+)", re.IGNORECASE)
 HANDLE_PATTERN = re.compile(r"@([A-Za-z0-9_]+)")
-X_COLLECTION_TIMEOUT_SECONDS = 75
+X_COLLECTION_TIMEOUT_SECONDS = 180
 X_COLLECTION_ATTEMPTS = 2
 TRANSPARENT_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
 
@@ -510,25 +510,36 @@ class XBrowserCollector:
         try:
             await page.goto(
                 f"https://x.com/{account.username}",
-                wait_until="domcontentloaded",
-                timeout=60_000,
+                wait_until="commit",
+                timeout=90_000,
             )
             try:
                 # 1. 【Twitter】【只等待推文节点挂载而不依赖无头浏览器可见性计算】
                 await page.wait_for_selector(
                     'article[data-testid="tweet"]',
                     state="attached",
-                    timeout=30_000,
+                    timeout=8_000,
                 )
                 # 2. 【Twitter】【等待首屏外链卡片完成异步渲染后再提取图片】
                 await page.wait_for_timeout(3_000)
             except PlaywrightTimeoutError:
-                page_state = await self._describe_page_failure(page, api_responses, browser_errors)
-                raise RuntimeError(f"x.com 未加载推文节点：{page_state}") from None
+                # 1. 【Twitter】【首屏未挂载时用鼠标滚轮触发时间线加载】
+                await page.mouse.move(450, 350)
+                await page.mouse.wheel(0, 2_400)
+                await page.wait_for_timeout(5_000)
+                try:
+                    await page.wait_for_selector(
+                        'article[data-testid="tweet"]',
+                        state="attached",
+                        timeout=60_000,
+                    )
+                except PlaywrightTimeoutError:
+                    page_state = await self._describe_page_failure(page, api_responses, browser_errors)
+                    raise RuntimeError(f"x.com 未加载推文节点：{page_state}") from None
 
             # 3. 【Twitter】【分段读取虚拟列表并保留已离开页面的推文】
             tweets: dict[str, Tweet] = {}
-            for _ in range(6):
+            for _ in range(12):
                 articles = page.locator('article[data-testid="tweet"]')
                 for index in range(await articles.count()):
                     try:
@@ -544,8 +555,10 @@ class XBrowserCollector:
                 enough_for_initialization = not stop_ids and len(tweets) >= 3
                 if found_stop_id or enough_for_initialization or len(tweets) >= 25:
                     break
+                # 4. 【Twitter】【模拟真实用户滚轮并等待下一批虚拟列表节点】
+                await page.mouse.move(450, 350)
                 await page.mouse.wheel(0, 2_400)
-                await page.wait_for_timeout(1_500)
+                await page.wait_for_timeout(5_000)
 
             return sorted(tweets.values(), key=lambda item: int(item.tweet_id))
         finally:
